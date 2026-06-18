@@ -1,0 +1,12 @@
+model: yolo11s.pt
+data: D:/cellphone_drivers_yolo/data.yaml
+epochs: 80
+imgsz: 640
+batch: 16
+patience: 10
+project: runs
+name: cellphone_drivers_yolo
+device: 0
+seed: 42
+fraction: 1.0
+conf: 0.25

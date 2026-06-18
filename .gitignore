@@ -1,0 +1,16 @@
+**pycache**/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+runs/
+outputs/*
+!outputs/.gitkeep
+*.pt
+*.onnx
+datasets/
+wandb/
+.DS_Store
+.env
+.venv/
+models/*
+!models/.gitkeep
