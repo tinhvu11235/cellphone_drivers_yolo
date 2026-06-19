@@ -9,7 +9,7 @@ Classes:
 - `phone`
 - `wheel`
 
-The Gradio demo displays detections for all four classes, but raises an alert only when `Cellphone-in-drivers` is detected.
+The Gradio demo displays detections for all four classes and raises a practical alert when a detected `phone` is spatially associated with a detected `driver`, optionally reinforced by proximity to `wheel`.
 
 ## Workflow
 
@@ -63,7 +63,7 @@ python src/dataset_check.py \
 
 ## Train On Kaggle GPU
 
-Use `scripts/kaggle_train.ipynb`. Attach the COCO dataset to the notebook. The notebook will convert the dataset to YOLO inside `/kaggle/working/cellphone_drivers_yolo`, validate it, train, evaluate, benchmark, and zip artifacts.
+Use `scripts/kaggle_train.ipynb`. Attach the converted YOLO dataset to the notebook. The notebook finds `data.yaml` under `/kaggle/input`, validates it, trains, evaluates, benchmarks, and zips artifacts.
 
 Inside Kaggle, the cloned repo path is:
 
@@ -76,14 +76,28 @@ The notebook calls scripts through absolute paths built from that clone path, fo
 ```text
 /kaggle/working/homeobjects-yolo-detector/src/train.py
 /kaggle/working/homeobjects-yolo-detector/src/evaluate.py
-/kaggle/working/homeobjects-yolo-detector/scripts/convert_coco_to_yolo.py
+/kaggle/working/homeobjects-yolo-detector/src/benchmark.py
 ```
+
+The attached YOLO dataset path is auto-detected. It will look like:
+
+```text
+/kaggle/input/<converted-yolo-dataset>/data.yaml
+```
+
+If the uploaded `data.yaml` still contains a stale local or `/kaggle/working/...` `path:` value, the notebook writes a patched training YAML under:
+
+```text
+/kaggle/working/homeobjects-yolo-detector/outputs/cellphone_drivers_kaggle_data.yaml
+```
+
+Training and evaluation use that patched YAML so image paths resolve under the attached `/kaggle/input/...` dataset.
 
 Core training command:
 
 ```bash
 python /kaggle/working/homeobjects-yolo-detector/src/train.py \
-  --data /kaggle/working/cellphone_drivers_yolo/data.yaml \
+  --data /kaggle/input/<converted-yolo-dataset>/data.yaml \
   --model yolo11s.pt \
   --epochs 80 \
   --imgsz 640 \
@@ -100,7 +114,7 @@ python /kaggle/working/homeobjects-yolo-detector/src/train.py \
 ```bash
 python /kaggle/working/homeobjects-yolo-detector/src/evaluate.py \
   --weights /kaggle/working/homeobjects-yolo-detector/runs/cellphone_drivers_yolo/weights/best.pt \
-  --data /kaggle/working/cellphone_drivers_yolo/data.yaml \
+  --data /kaggle/input/<converted-yolo-dataset>/data.yaml \
   --imgsz 640 \
   --device 0 \
   --split val \
@@ -112,19 +126,53 @@ The Kaggle notebook also evaluates the held-out test split:
 ```bash
 python /kaggle/working/homeobjects-yolo-detector/src/evaluate.py \
   --weights /kaggle/working/homeobjects-yolo-detector/runs/cellphone_drivers_yolo/weights/best.pt \
-  --data /kaggle/working/cellphone_drivers_yolo/data.yaml \
+  --data /kaggle/input/<converted-yolo-dataset>/data.yaml \
   --imgsz 640 \
   --device 0 \
   --split test \
   --output outputs/eval_summary_test.json
 ```
 
+## Evaluate Rule-Based Behavior Heuristic
+
+The behavior decision is rule-based, not a separately trained behavior model.
+YOLO detects objects, then `src/driver_phone_heuristic.py` infers
+`driver_using_phone` from the spatial relationship between driver/person,
+phone/cellphone, and wheel/steering wheel boxes.
+
+Create a manual image-level label CSV with:
+
+```csv
+image,label
+img_001.jpg,1
+img_002.jpg,0
+img_003.jpg,1
+img_004.jpg,0
+```
+
+Use `configs/driver_phone_usage_labels_template.csv` as a starting point, then
+run:
+
+```bash
+python src/heuristic_evaluate.py \
+  --weights models/best.pt \
+  --labels-csv configs/driver_phone_usage_labels_template.csv \
+  --images-dir path/to/test/images \
+  --imgsz 640 \
+  --device cpu \
+  --output-json outputs/heuristic_eval_summary.json \
+  --output-csv outputs/heuristic_eval_predictions.csv
+```
+
+The report includes Accuracy, Precision, Recall, F1-score, and confusion matrix
+for the final image-level behavior decision.
+
 ## Benchmark
 
 ```bash
 python /kaggle/working/homeobjects-yolo-detector/src/benchmark.py \
   --weights /kaggle/working/homeobjects-yolo-detector/runs/cellphone_drivers_yolo/weights/best.pt \
-  --source /kaggle/working/cellphone_drivers_yolo/images/val \
+  --source /kaggle/input/<converted-yolo-dataset>/images/val \
   --imgsz 640 \
   --device 0 \
   --warmup 20 \
@@ -167,7 +215,7 @@ Limitations:
 
 - May fail under poor lighting, glare, motion blur, occlusion, or unusual camera angles.
 - May miss small phones or confuse phone-like objects with phones.
-- Alert quality depends on the `Cellphone-in-drivers` class quality in the dataset.
+- Alert quality depends on reliable `driver`, `phone`, and `wheel` detections and the spatial heuristic used to associate a phone with the driver.
 
 Ethical considerations:
 

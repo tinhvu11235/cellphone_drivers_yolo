@@ -58,18 +58,22 @@ def extract_metrics(metrics: Any, model: Any) -> dict[str, Any]:
     per_class_recall = to_float_list(get_attr(box, "r"))
     per_class_map50 = to_float_list(get_attr(box, "ap50"))
     per_class_map5095 = to_float_list(get_attr(box, "maps"))
-    class_ids = sorted(names)
+    metric_class_ids = [int(class_id) for class_id in as_list(get_attr(box, "ap_class_index"))]
+    if not metric_class_ids:
+        metric_class_ids = sorted(names)
+    metric_positions = {class_id: position for position, class_id in enumerate(metric_class_ids)}
 
     per_class: list[dict[str, Any]] = []
-    for position, class_id in enumerate(class_ids):
+    for class_id in sorted(names):
+        position = metric_positions.get(class_id)
         per_class.append(
             {
                 "class_id": class_id,
                 "class_name": names[class_id],
-                "precision": _list_get(per_class_precision, position),
-                "recall": _list_get(per_class_recall, position),
-                "mAP50": _list_get(per_class_map50, position),
-                "mAP50_95": _list_get(per_class_map5095, position),
+                "precision": _metric_get(per_class_precision, position),
+                "recall": _metric_get(per_class_recall, position),
+                "mAP50": _metric_get(per_class_map50, position),
+                "mAP50_95": _map_get(per_class_map5095, class_id, position, len(names)),
             }
         )
 
@@ -101,6 +105,22 @@ def extract_metrics(metrics: Any, model: Any) -> dict[str, Any]:
 def _list_get(values: list[Any], index: int) -> Any:
     """Return list value or None when unavailable."""
     return values[index] if index < len(values) else None
+
+
+def _metric_get(values: list[Any], position: int | None) -> Any:
+    """Return a metric by compact class position, or None for absent classes."""
+    if position is None:
+        return None
+    return _list_get(values, position)
+
+
+def _map_get(values: list[Any], class_id: int, position: int | None, class_count: int) -> Any:
+    """Return class mAP, avoiding misleading values for absent classes."""
+    if position is None:
+        return None
+    if len(values) == class_count:
+        return _list_get(values, class_id)
+    return _list_get(values, position)
 
 
 def warn_unavailable(summary: dict[str, Any]) -> None:

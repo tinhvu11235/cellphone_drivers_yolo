@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -10,11 +11,22 @@ import gradio as gr
 import numpy as np
 import pandas as pd
 
+from src.driver_phone_heuristic import infer_driver_phone_usage
+
 
 DEFAULT_WEIGHTS = Path("models/best.pt")
+os.environ.setdefault("YOLO_CONFIG_DIR", str(Path("outputs/ultralytics_config")))
+os.environ.setdefault("MPLCONFIGDIR", str(Path("outputs/matplotlib_config")))
+
 DEVICE = "cpu"
 DETECTION_COLUMNS = ["class_name", "confidence", "x1", "y1", "x2", "y2"]
 ALERT_CLASS_NAMES = {"Cellphone-in-drivers", "Cellphone-in-driver"}
+DRIVER_CLASS_NAMES = {"driver"}
+PHONE_CLASS_NAMES = {"phone"}
+WHEEL_CLASS_NAMES = {"wheel"}
+DRIVER_PAD_X = 0.2
+DRIVER_PAD_Y = 0.12
+WHEEL_PAD = 0.3
 
 MODEL = None
 MODEL_ERROR: str | None = None
@@ -54,15 +66,173 @@ def model_status() -> str:
     return f"**Model status:** loaded `{DEFAULT_WEIGHTS}` on CPU."
 
 
-def alert_status(rows: list[dict[str, Any]]) -> str:
+def class_name(row: dict[str, Any]) -> str:
+    """Return a normalized detection class name."""
+    return str(row.get("class_name", "")).strip()
+
+
+def has_class(row: dict[str, Any], names: set[str]) -> bool:
+    """Return True when a detection row belongs to one of the class names."""
+    return class_name(row).lower() in {name.lower() for name in names}
+
+
+def box_area(row: dict[str, Any]) -> float:
+    """Return bbox area in pixels."""
+    return max(0.0, float(row["x2"]) - float(row["x1"])) * max(0.0, float(row["y2"]) - float(row["y1"]))
+
+
+def box_center(row: dict[str, Any]) -> tuple[float, float]:
+    """Return bbox center in pixels."""
+    return ((float(row["x1"]) + float(row["x2"])) / 2, (float(row["y1"]) + float(row["y2"])) / 2)
+
+
+def expand_box(row: dict[str, Any], pad_x: float, pad_y: float) -> dict[str, float]:
+    """Expand a bbox by a ratio of its width and height."""
+    width = max(0.0, float(row["x2"]) - float(row["x1"]))
+    height = max(0.0, float(row["y2"]) - float(row["y1"]))
+    return {
+        "x1": float(row["x1"]) - width * pad_x,
+        "y1": float(row["y1"]) - height * pad_y,
+        "x2": float(row["x2"]) + width * pad_x,
+        "y2": float(row["y2"]) + height * pad_y,
+    }
+
+
+def contains_point(box: dict[str, float] | dict[str, Any], point: tuple[float, float]) -> bool:
+    """Return True when a point is inside a bbox."""
+    x, y = point
+    return float(box["x1"]) <= x <= float(box["x2"]) and float(box["y1"]) <= y <= float(box["y2"])
+
+
+def intersection_area(first: dict[str, Any], second: dict[str, Any]) -> float:
+    """Return bbox intersection area."""
+    x1 = max(float(first["x1"]), float(second["x1"]))
+    y1 = max(float(first["y1"]), float(second["y1"]))
+    x2 = min(float(first["x2"]), float(second["x2"]))
+    y2 = min(float(first["y2"]), float(second["y2"]))
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def phone_overlap_ratio(phone: dict[str, Any], driver: dict[str, Any]) -> float:
+    """Return how much of the phone box overlaps the driver box."""
+    area = box_area(phone)
+    if area <= 0:
+        return 0.0
+    return intersection_area(phone, driver) / area
+
+
+def relative_driver_y(phone: dict[str, Any], driver: dict[str, Any]) -> float:
+    """Return phone center Y position relative to driver height."""
+    _, phone_y = box_center(phone)
+    driver_height = max(1.0, float(driver["y2"]) - float(driver["y1"]))
+    return (phone_y - float(driver["y1"])) / driver_height
+
+
+def near_any_wheel(phone: dict[str, Any], wheels: list[dict[str, Any]]) -> bool:
+    """Return True when a phone is close to a steering wheel detection."""
+    phone_center = box_center(phone)
+    for wheel in wheels:
+        expanded_wheel = expand_box(wheel, WHEEL_PAD, WHEEL_PAD)
+        if contains_point(expanded_wheel, phone_center) or intersection_area(phone, expanded_wheel) > 0:
+            return True
+    return False
+
+
+def driver_phone_risk(
+    driver: dict[str, Any],
+    phone: dict[str, Any],
+    wheels: list[dict[str, Any]],
+) -> tuple[int, list[str]]:
+    """Score the risk that a phone belongs to the driver."""
+    score = 0
+    reasons = []
+    phone_center = box_center(phone)
+    expanded_driver = expand_box(driver, DRIVER_PAD_X, DRIVER_PAD_Y)
+    overlap = phone_overlap_ratio(phone, driver)
+    rel_y = relative_driver_y(phone, driver)
+
+    if contains_point(driver, phone_center):
+        score += 4
+        reasons.append("phone center is inside the driver box")
+    elif overlap >= 0.2:
+        score += 4
+        reasons.append("phone overlaps the driver box")
+    elif overlap >= 0.05:
+        score += 3
+        reasons.append("phone partially overlaps the driver box")
+    elif contains_point(expanded_driver, phone_center):
+        score += 2
+        reasons.append("phone is close to the driver box")
+
+    if contains_point(expanded_driver, phone_center) and rel_y <= 0.45:
+        score += 2
+        reasons.append("phone is near the upper driver area")
+    if contains_point(expanded_driver, phone_center) and 0.35 <= rel_y <= 1.1:
+        score += 2
+        reasons.append("phone is in the driver's looking-down area")
+    if near_any_wheel(phone, wheels) and contains_point(expanded_driver, phone_center):
+        score += 1
+        reasons.append("phone is near the steering wheel")
+
+    return score, reasons
+
+
+def best_driver_phone_alert(rows: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    """Return the strongest driver-phone alert level and supporting reasons."""
+    if any(has_class(row, ALERT_CLASS_NAMES) for row in rows):
+        return "high", ["model predicted the legacy alert class"]
+
+    drivers = [row for row in rows if has_class(row, DRIVER_CLASS_NAMES)]
+    phones = [row for row in rows if has_class(row, PHONE_CLASS_NAMES)]
+    wheels = [row for row in rows if has_class(row, WHEEL_CLASS_NAMES)]
+    if not drivers or not phones:
+        return "none", []
+
+    best_score = 0
+    best_reasons: list[str] = []
+    for driver in drivers:
+        for phone in phones:
+            score, reasons = driver_phone_risk(driver, phone, wheels)
+            if score > best_score:
+                best_score = score
+                best_reasons = reasons
+
+    if best_score >= 6:
+        return "high", best_reasons
+    if best_score >= 3:
+        return "medium", best_reasons
+    return "none", []
+
+
+def rows_to_heuristic_detections(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert app table rows to the shared heuristic input format."""
+    return [
+        {
+            "class_name": row["class_name"],
+            "confidence": row["confidence"],
+            "bbox": [row["x1"], row["y1"], row["x2"], row["y2"]],
+        }
+        for row in rows
+    ]
+
+
+def alert_status(rows: list[dict[str, Any]], image_shape: tuple[int, ...] | None = None) -> str:
     """Return alert markdown for driver cellphone-use detections."""
-    has_alert = any(str(row.get("class_name")) in ALERT_CLASS_NAMES for row in rows)
-    if has_alert:
+    if image_shape is None:
+        return "### Alert status\nNo driver cellphone-use detection found."
+
+    prediction = infer_driver_phone_usage(rows_to_heuristic_detections(rows), image_shape)
+    risk_score = float(prediction["risk_score"])
+    reason = prediction["reason"]
+    if prediction["driver_using_phone"]:
         return (
-            "### Alert: Cellphone-in-drivers detected\n"
-            "The model found a driver cellphone-use detection in this frame."
+            "### Alert: potential driver cellphone use\n"
+            f"Rule reason: `{reason}`. Risk score: {risk_score:.2f}."
         )
-    return "### Alert status\nNo driver cellphone-use detection found."
+    return (
+        "### Alert status\n"
+        f"No driver cellphone-use detection found. Rule reason: `{reason}`. Risk score: {risk_score:.2f}."
+    )
 
 
 def detect(
@@ -80,7 +250,7 @@ def detect(
     start = time.perf_counter()
     image_array = to_rgb_array(image)
     results = MODEL.predict(
-        source=image_array,
+        source=to_model_source(image, image_array),
         conf=float(confidence),
         imgsz=int(image_size),
         iou=float(iou_threshold),
@@ -132,7 +302,7 @@ def detect(
     )
 
     table = pd.DataFrame(rows, columns=DETECTION_COLUMNS)
-    return annotated_rgb, table, alert_status(rows), "\n".join(performance)
+    return annotated_rgb, table, alert_status(rows, image_array.shape), "\n".join(performance)
 
 
 def to_rgb_array(image: Any) -> np.ndarray:
@@ -147,13 +317,20 @@ def to_rgb_array(image: Any) -> np.ndarray:
     return image_array
 
 
+def to_model_source(image: Any, image_array: np.ndarray) -> Any:
+    """Return an Ultralytics input with color channels matching its loader."""
+    if hasattr(image, "convert"):
+        return image.convert("RGB")
+    return image_array[:, :, ::-1]
+
+
 with gr.Blocks(title="Driver Cellphone Use YOLO Detector") as demo:
     gr.Markdown("# Driver Cellphone Use YOLO Detector")
     gr.Markdown(
         "Fine-tuned YOLO model for detecting driver cellphone-use scenes, drivers, phones, and steering wheels."
     )
     gr.Markdown(
-        "The detection table shows all four classes; the alert is raised only for `Cellphone-in-drivers`."
+        "The detection table shows all classes; the alert is raised when a phone is spatially associated with the driver."
     )
     gr.Markdown(model_status())
 

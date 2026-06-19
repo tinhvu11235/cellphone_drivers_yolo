@@ -50,25 +50,37 @@ def dataset_root_from_yaml(config: dict[str, Any], yaml_path: Path) -> Path:
         return yaml_path.parent.resolve()
     root_path = Path(str(root)).expanduser()
     if root_path.is_absolute():
+        if split_exists_under_root(config, root_path):
+            return root_path
+        if split_exists_under_root(config, yaml_path.parent):
+            return yaml_path.parent.resolve()
         return root_path
     candidate = (yaml_path.parent / root_path).resolve()
-    if candidate.exists():
+    if candidate.exists() or split_exists_under_root(config, candidate):
         return candidate
 
     # Some dataset copies keep the Ultralytics YAML inside the dataset root while
     # the YAML still contains a download-time parent path from the original export.
     # In that case, prefer the YAML parent when the declared split paths exist.
-    for split_name in ("train", "val"):
+    if split_exists_under_root(config, yaml_path.parent):
+        return yaml_path.parent.resolve()
+
+    return candidate
+
+
+def split_exists_under_root(config: dict[str, Any], root: Path) -> bool:
+    """Return True when any declared split resolves under root."""
+    for split_name in ("train", "val", "test"):
         split_value = config.get(split_name)
         split_items = split_value if isinstance(split_value, list) else [split_value]
         for item in split_items:
             if item in (None, ""):
                 continue
             split_path = Path(str(item)).expanduser()
-            if not split_path.is_absolute() and (yaml_path.parent / split_path).exists():
-                return yaml_path.parent.resolve()
-
-    return candidate
+            candidate = split_path if split_path.is_absolute() else (root / split_path).resolve()
+            if candidate.exists():
+                return True
+    return False
 
 
 def resolve_split_paths(value: Any, dataset_root: Path) -> list[Path]:
